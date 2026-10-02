@@ -1,0 +1,79 @@
+# Check from the outside: is the page up, is the database answering.
+# Runs on GitHub every 15 minutes, opens the page like any visitor, asks the database health
+# endpoint and reports both results to the database (uptime_ping). A failing check shows up
+# on the diagnostics screen even when the app itself is not reachable.
+#
+# Lives in tools/uptime.yml; tools/publish-web.mjs copies it to .github/workflows/uptime.yml of the
+# public repository on every publish. Keep it ASCII only and free of any product wording:
+# the publish check stops on anything else.
+#
+# Repository secrets: VIDV_URL (database address), VIDV_KEY (public API key),
+# VIDV_UPTIME_TOKEN (key issued once by the database). Page address: variable or secret VIDV_PAGE.
+name: ping
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ping
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    env:
+      VIDV_URL: ${{ secrets.VIDV_URL }}
+      VIDV_KEY: ${{ secrets.VIDV_KEY }}
+      VIDV_UPTIME_TOKEN: ${{ secrets.VIDV_UPTIME_TOKEN }}
+      VIDV_PAGE: ${{ vars.VIDV_PAGE || secrets.VIDV_PAGE }}
+    steps:
+      - name: settings present
+        run: |
+          # Without settings a "down" report would be false: stop loudly instead.
+          for v in VIDV_URL VIDV_KEY VIDV_UPTIME_TOKEN VIDV_PAGE; do
+            if [ -z "${!v}" ]; then echo "missing: $v"; exit 1; fi
+          done
+
+      - name: page
+        run: |
+          out=$(curl -sS -o /dev/null -m 20 -w '%{http_code} %{time_total}' "$VIDV_PAGE") || true
+          [ -n "$out" ] || out="000 0"
+          code=${out%% *}
+          ms=$(awk -v s="${out##* }" 'BEGIN { printf "%d", s * 1000 }')
+          ok=false
+          if [ "$code" -ge 200 ] && [ "$code" -lt 400 ]; then ok=true; fi
+          echo "page: $code ${ms} ms"
+          echo "PAGE_OK=$ok" >> "$GITHUB_ENV"
+          echo "PAGE_MS=$ms" >> "$GITHUB_ENV"
+
+      - name: database
+        run: |
+          out=$(curl -sS -o /dev/null -m 20 -w '%{http_code} %{time_total}' -H "apikey: $VIDV_KEY" "$VIDV_URL/auth/v1/health") || true
+          [ -n "$out" ] || out="000 0"
+          code=${out%% *}
+          ms=$(awk -v s="${out##* }" 'BEGIN { printf "%d", s * 1000 }')
+          ok=false
+          if [ "$code" -ge 200 ] && [ "$code" -lt 300 ]; then ok=true; fi
+          echo "database: $code ${ms} ms"
+          echo "DB_OK=$ok" >> "$GITHUB_ENV"
+          echo "DB_MS=$ms" >> "$GITHUB_ENV"
+
+      - name: report
+        run: |
+          body=$(jq -nc --arg t "$VIDV_UPTIME_TOKEN" --argjson po "$PAGE_OK" --argjson pm "$PAGE_MS" --argjson dok "$DB_OK" --argjson dm "$DB_MS" \
+            '{p_token: $t, p_page_ok: $po, p_page_ms: $pm, p_db_ok: $dok, p_db_ms: $dm}')
+          code=$(curl -sS -o reply.txt -m 20 -w '%{http_code}' -X POST \
+            -H "apikey: $VIDV_KEY" -H "content-type: application/json" \
+            -d "$body" "$VIDV_URL/rest/v1/rpc/uptime_ping") || true
+          # Logs of a public repository are public: print only the HTTP status and, on failure,
+          # the short error code from the reply (never its text).
+          echo "report: $code"
+          case "$code" in
+            2*) ;;
+            *) jq -r '"error code: " + (.code // "none")' reply.txt 2>/dev/null || true; exit 1 ;;
+          esac
