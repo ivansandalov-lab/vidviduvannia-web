@@ -34,12 +34,14 @@ jobs:
     steps:
       - name: settings present
         run: |
-          # Without settings a "down" report would be false: stop loudly instead.
+          # Not set up yet: skip quietly. A failing run every 15 minutes would mean a failure email
+          # every 15 minutes; a "down" report without settings would be false anyway.
           for v in VIDV_URL VIDV_KEY VIDV_UPTIME_TOKEN VIDV_PAGE; do
-            if [ -z "${!v}" ]; then echo "missing: $v"; exit 1; fi
+            if [ -z "${!v}" ]; then echo "not configured yet ($v is empty): skipping"; echo "SKIP=1" >> "$GITHUB_ENV"; exit 0; fi
           done
 
       - name: page
+        if: env.SKIP != '1'
         run: |
           out=$(curl -sS -o /dev/null -m 20 -w '%{http_code} %{time_total}' "$VIDV_PAGE") || true
           [ -n "$out" ] || out="000 0"
@@ -52,6 +54,7 @@ jobs:
           echo "PAGE_MS=$ms" >> "$GITHUB_ENV"
 
       - name: database
+        if: env.SKIP != '1'
         run: |
           out=$(curl -sS -o /dev/null -m 20 -w '%{http_code} %{time_total}' -H "apikey: $VIDV_KEY" "$VIDV_URL/auth/v1/health") || true
           [ -n "$out" ] || out="000 0"
@@ -64,6 +67,7 @@ jobs:
           echo "DB_MS=$ms" >> "$GITHUB_ENV"
 
       - name: report
+        if: env.SKIP != '1'
         run: |
           body=$(jq -nc --arg t "$VIDV_UPTIME_TOKEN" --argjson po "$PAGE_OK" --argjson pm "$PAGE_MS" --argjson dok "$DB_OK" --argjson dm "$DB_MS" \
             '{p_token: $t, p_page_ok: $po, p_page_ms: $pm, p_db_ok: $dok, p_db_ms: $dm}')
